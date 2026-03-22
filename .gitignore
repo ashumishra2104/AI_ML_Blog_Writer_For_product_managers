@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+list_models.py
+images/
+.ipynb_checkpoints/
+/tmp/
+readme_content.txt
+EOF
