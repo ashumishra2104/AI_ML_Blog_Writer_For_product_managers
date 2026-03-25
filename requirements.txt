@@ -7,4 +7,5 @@ google-genai
 streamlit
 pandas
 pypdf
-EOF
+wikipedia
+duckduckgo-search

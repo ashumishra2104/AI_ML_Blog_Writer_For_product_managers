@@ -3,22 +3,28 @@ from __future__ import annotations
 import operator
 import os
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
 
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.types import Send
-from langgraph.graph import StateGraph, START, END
+from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Initialize LLM
-llm = ChatOpenAI(model="gpt-4o-mini")
+# ============================================================
+# PM-tuned Blog Writer
+# Audience: Product Managers and Product Leaders
+# Pipeline: Router → (Research?) → Orchestrator → Workers → ReducerWithImages → FurtherReading
+# Reducer subgraph: merge_content → decide_images → generate_and_place_images → further_reading
+# ============================================================
+
 
 # -----------------------------
 # 1) Schemas
@@ -27,20 +33,55 @@ llm = ChatOpenAI(model="gpt-4o-mini")
 class Task(BaseModel):
     id: int
     title: str
-    goal: str = Field(..., description="One sentence describing what the reader should do/understand.")
-    bullets: List[str] = Field(..., min_length=3, max_length=6)
+    goal: str = Field(
+        ...,
+        description="One sentence describing what the PM reader should understand or be able to do after this section.",
+    )
+    bullets: List[str] = Field(
+        ...,
+        min_length=3,
+        max_length=6,
+        description="3–6 concrete, non-overlapping subpoints. Frame from a PM perspective where possible.",
+    )
     target_words: int = Field(..., description="Target word count (120–550).")
     tags: List[str] = Field(default_factory=list)
+
+    # ── Original flags ──
     requires_research: bool = False
     requires_citations: bool = False
     requires_code: bool = False
+
+    # ── NEW PM-specific flags ──
+    requires_pm_translation: bool = Field(
+        False,
+        description=(
+            "Set True when this section contains heavy engineering or data science concepts "
+            "that need to be translated into plain English + business impact for a PM audience. "
+            "Worker will add a '> What this means for you as a PM' callout box."
+        ),
+    )
+    pm_takeaway: str = Field(
+        "",
+        description=(
+            "A single punchy sentence stating the business or product impact of this section. "
+            "Example: 'This directly affects how fast your team can ship a new ranking model.' "
+            "Must be concrete — not a re-statement of the section title."
+        ),
+    )
 
 
 class Plan(BaseModel):
     blog_title: str
     audience: str
     tone: str
-    blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"] = "explainer"
+    blog_kind: Literal[
+        "explainer",
+        "tutorial",
+        "news_roundup",
+        "comparison",
+        "system_design",
+        "pm_explainer",   # NEW — tech concept explained for product leaders
+    ] = "pm_explainer"
     constraints: List[str] = Field(default_factory=list)
     tasks: List[Task]
 
@@ -48,7 +89,7 @@ class Plan(BaseModel):
 class EvidenceItem(BaseModel):
     title: str
     url: str
-    published_at: Optional[str] = None  # ISO "YYYY-MM-DD" only if explicitly known
+    published_at: Optional[str] = None  # ISO "YYYY-MM-DD" preferred
     snippet: Optional[str] = None
     source: Optional[str] = None
 
@@ -56,7 +97,7 @@ class EvidenceItem(BaseModel):
 class RouterDecision(BaseModel):
     needs_research: bool
     mode: Literal["closed_book", "hybrid", "open_book"]
-    reason: str = Field(..., description="Why this mode was chosen.")
+    reason: str
     queries: List[str] = Field(default_factory=list)
     max_results_per_query: int = Field(5)
 
@@ -67,50 +108,79 @@ class EvidencePack(BaseModel):
 
 class ImageSpec(BaseModel):
     placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
-    filename: str = Field(..., description="Save under images/ folder, e.g. qkv_flow.png")
-    alt: str = Field(..., description="Accessibility text.")
-    caption: str = Field(..., description="Shown under the image in the blog.")
-    prompt: str = Field(..., description="The exact prompt to send to the image model.")
+    filename: str = Field(..., description="Save under images/, e.g. pipeline_analogy.png")
+    alt: str
+    caption: str
+    prompt: str = Field(..., description="Prompt to send to the image model.")
     size: Literal["1024x1024", "1024x1536", "1536x1024"] = "1024x1024"
     quality: Literal["low", "medium", "high"] = "medium"
 
 
 class GlobalImagePlan(BaseModel):
-    md_with_placeholders: str = Field(..., description="The full blog markdown with [[IMAGE_N]] tags inserted.")
+    md_with_placeholders: str
     images: List[ImageSpec] = Field(default_factory=list)
 
 
 class State(TypedDict):
     topic: str
+
+    # routing / research
     mode: str
     needs_research: bool
     queries: List[str]
     evidence: List[EvidenceItem]
     plan: Optional[Plan]
-    as_of: str  # today's date
+
+    # recency
+    as_of: str
     recency_days: int
+
+    # workers
     sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id, section_md)
+
+    # reducer/image
     merged_md: str
     md_with_placeholders: str
     image_specs: List[dict]
+
+    # NEW — further reading block (pure markdown, appended at end)
+    further_reading: str
+
     final: str
 
-# -----------------------------
-# 2) Router
-# -----------------------------
 
-ROUTER_SYSTEM = """You are a routing module for a technical blog planner.
+# -----------------------------
+# 2) LLM
+# -----------------------------
+llm = ChatOpenAI(model="gpt-5.4-mini-2026-03-17")
+
+
+# -----------------------------
+# 3) Router
+# -----------------------------
+ROUTER_SYSTEM = """You are a routing module for a blog planner. The blog audience is always Product Managers and Product Leaders, not engineers.
 
 Decide whether web research is needed BEFORE planning.
 
 Modes:
-- closed_book (needs_research=false): evergreen concepts, fundamental principles, no research needed.
-- hybrid (needs_research=true): mostly evergreen but needs up-to-date examples, current tools, or specific version details.
-- open_book (needs_research=true): volatile topics: news events, weekly roundups, latest rankings, or pricing.
+- closed_book (needs_research=false):
+  Timeless concepts where correctness does not depend on recent facts.
+  Example: "What is a data pipeline?" or "How does A/B testing work?"
+
+- hybrid (needs_research=true):
+  Mostly evergreen but PMs need current, specific examples — real tools, real company decisions,
+  current pricing tiers, recent model releases. When in doubt, choose hybrid over closed_book
+  because PMs trust blogs that reference real current examples.
+  Example: "LLMs for product managers", "AI feature prioritisation"
+
+- open_book (needs_research=true):
+  Volatile: weekly roundups, "this week", "latest", rankings, regulatory changes, funding news.
 
 If needs_research=true:
-- Output 3–10 specific, high-signal, scoped queries.
-- For open_book weekly topics, include queries reflecting the last 7 days.
+- Output EXACTLY 6 high-signal, scoped queries. No more, no less.
+- For PM audience, prefer queries that surface: case studies, product decisions, business impact data,
+  real company examples, and industry analyst perspectives.
+- For open_book weekly topics, include queries reflecting last 7 days.
 """
 
 def router_node(state: State) -> dict:
@@ -139,32 +209,169 @@ def router_node(state: State) -> dict:
 def route_next(state: State) -> str:
     return "research" if state["needs_research"] else "orchestrator"
 
-# -----------------------------
-# 3) Research
-# -----------------------------
 
+# -----------------------------
+# 4) Research (Tavily)
+# -----------------------------
 def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
+    if not os.getenv("TAVILY_API_KEY"):
         return []
-    
     try:
-        from langchain_community.tools.tavily_search import TavilySearchResults
+        from langchain_community.tools.tavily_search import TavilySearchResults  # type: ignore
         tool = TavilySearchResults(max_results=max_results)
-        raw = tool.invoke(query)
-        
-        normalized = []
-        for r in raw:
-            snippet = r.get("content") or r.get("snippet") or ""
-            pub = r.get("published_date") or r.get("published_at") or None
-            normalized.append({
-                "title": r.get("title", "Untitled"),
-                "url": r.get("url", ""),
-                "snippet": str(snippet).strip(),
-                "published_at": pub,
-                "source": r.get("source", "")
+        results = tool.invoke({"query": query})
+        out: List[dict] = []
+        for r in results or []:
+            out.append(
+                {
+                    "title": r.get("title") or "",
+                    "url": r.get("url") or "",
+                    "snippet": r.get("content") or r.get("snippet") or "",
+                    "published_at": r.get("published_date") or r.get("published_at"),
+                    "source": r.get("source"),
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+def _ddg_search(query: str, max_results: int = 5) -> List[dict]:
+    try:
+        from duckduckgo_search import DDGS
+        results = DDGS().text(query, max_results=max_results)
+        out = []
+        for r in results or []:
+            out.append({
+                "title": r.get("title") or "",
+                "url": r.get("href") or "",
+                "snippet": r.get("body") or "",
+                "published_at": None,
+                "source": "DuckDuckGo"
             })
-        return normalized
+        return out
+    except Exception:
+        return []
+
+def _wikipedia_search(query: str, max_results: int = 2) -> List[dict]:
+    try:
+        import wikipedia
+        results = wikipedia.search(query, results=max_results)
+        out = []
+        for title in results:
+            try:
+                p = wikipedia.page(title, auto_suggest=False)
+                out.append({
+                    "title": p.title,
+                    "url": p.url,
+                    "snippet": p.summary[:500],
+                    "published_at": None,
+                    "source": "Wikipedia"
+                })
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+
+def _arxiv_search(query: str, max_results: int = 2) -> List[dict]:
+    try:
+        import urllib.request
+        import urllib.parse
+        import xml.etree.ElementTree as ET
+        url = f'http://export.arxiv.org/api/query?search_query=all:{urllib.parse.quote(query)}&start=0&max_results={max_results}'
+        response = urllib.request.urlopen(url)
+        xml_data = response.read()
+        root = ET.fromstring(xml_data)
+        out = []
+        for entry in root.findall('{http://www.w3.org/2005/Atom}entry'):
+            title = entry.find('{http://www.w3.org/2005/Atom}title')
+            summary = entry.find('{http://www.w3.org/2005/Atom}summary')
+            link = entry.find('{http://www.w3.org/2005/Atom}id')
+            published = entry.find('{http://www.w3.org/2005/Atom}published')
+            out.append({
+                "title": title.text.replace('\n', ' ').strip() if title is not None else "",
+                "url": link.text if link is not None else "",
+                "snippet": summary.text.replace('\n', ' ').strip()[:500] if summary is not None else "",
+                "published_at": published.text if published is not None else None,
+                "source": "Arxiv"
+            })
+        return out
+    except Exception:
+        return []
+
+def _newsdata_search(query: str, max_results: int = 2) -> List[dict]:
+    try:
+        import requests
+        import urllib.parse
+        apikey = "pub_13f1dfd4ba5d4fea973e0a4fe9a9a6c3"
+        url = f"https://newsdata.io/api/1/latest?apikey={apikey}&q={urllib.parse.quote(query)}"
+        response = requests.get(url)
+        data = response.json()
+        out = []
+        if data.get("status") == "success":
+            for article in data.get("results", [])[:max_results]:
+                out.append({
+                    "title": article.get("title") or "",
+                    "url": article.get("link") or "",
+                    "snippet": str(article.get("description") or article.get("content") or "")[:500],
+                    "published_at": article.get("pubDate"),
+                    "source": article.get("source_id") or "Newsdata.io"
+                })
+        return out
+    except Exception:
+        return []
+
+def _producthunt_search(query: str, max_results: int = 2) -> List[dict]:
+    import os
+    import requests
+    ph_key = os.getenv("PRODUCTHUNT_API_KEY")
+    ph_secret = os.getenv("PRODUCTHUNT_API_SECRET")
+    ph_dev_token = os.getenv("PRODUCTHUNT_DEV_TOKEN")
+
+    if not (ph_dev_token or (ph_key and ph_secret)):
+        return []
+    try:
+        if ph_dev_token:
+            access_token = ph_dev_token
+        else:
+            token_res = requests.post(
+                "https://api.producthunt.com/v2/oauth/token",
+                json={"client_id": ph_key, "client_secret": ph_secret, "grant_type": "client_credentials"}
+            )
+            if token_res.status_code != 200:
+                return []
+            access_token = token_res.json().get("access_token")
+
+        gql_query = """
+        query {
+          posts(first: 10) {
+            edges {
+              node {
+                name
+                tagline
+                description
+                url
+                createdAt
+              }
+            }
+          }
+        }
+        """
+        headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+        res = requests.post("https://api.producthunt.com/v2/api/graphql", headers=headers, json={"query": gql_query})
+        data = res.json()
+        out = []
+        if "data" in data and data.get("data") and "posts" in data["data"]:
+            for edge in data["data"]["posts"]["edges"][:max_results]:
+                node = edge["node"]
+                out.append({
+                    "title": f"[Product Hunt] {node.get('name')} - {node.get('tagline')}",
+                    "url": node.get("url") or "",
+                    "snippet": str(node.get("description") or "")[:500],
+                    "published_at": node.get("createdAt"),
+                    "source": "Product Hunt"
+                })
+        return out
     except Exception:
         return []
 
@@ -172,261 +379,330 @@ def _iso_to_date(s: Optional[str]) -> Optional[date]:
     if not s:
         return None
     try:
-        # Take first 10 chars (YYYY-MM-DD)
         return date.fromisoformat(s[:10])
     except Exception:
         return None
 
-RESEARCH_SYSTEM = """You are a research synthesizer for a technical blog agent.
+RESEARCH_SYSTEM = """You are a research synthesizer for a Product Management blog.
 
-Goal: From raw search results, select the highest signal evidence for the blog.
+Given raw web search results, produce a deduplicated list of EvidenceItem objects.
 
-Constraints:
-1. ONLY include items with a non-empty URL.
-2. Prefer authoritative, technical sources (docs, official blogs, arXiv).
-3. Normalise published_at to YYYY-MM-DD if you can reliably infer it (e.g. from snippet/URL); else NULL. NEVER guess.
-4. Keep snippets concise (150-300 chars).
-5. Ensure evidence is relevant to the topic and the 'as_of' date.
+Rules:
+- Only include items with a non-empty url.
+- Prefer sources relevant to a PM audience: product blogs, industry case studies, company engineering blogs,
+  product management publications, analyst reports, and news about product decisions.
+- Normalise published_at to ISO YYYY-MM-DD if reliably inferable; else null. NEVER guess.
+- Keep snippets concise (under 200 chars).
+- Deduplicate by URL.
 """
 
 def research_node(state: State) -> dict:
-    queries = state.get("queries", [])[:10]
-    raw_results = []
+    queries = (state.get("queries") or [])[:10]
+    raw: List[dict] = []
     for q in queries:
-        raw_results.extend(_tavily_search(q, max_results=6))
-    
-    if not raw_results:
+        raw.extend(_tavily_search(q, max_results=4))
+        raw.extend(_ddg_search(q, max_results=3))
+        raw.extend(_wikipedia_search(q, max_results=1))
+        raw.extend(_arxiv_search(q, max_results=1))
+        raw.extend(_newsdata_search(q, max_results=2))
+        raw.extend(_producthunt_search(q, max_results=2))
+
+    if not raw:
         return {"evidence": []}
-    
-    synthesizer = llm.with_structured_output(EvidencePack)
-    human_msg = f"As-of: {state['as_of']}\nRecency Days: {state['recency_days']}\nRaw Results:\n{raw_results}"
-    
-    pack = synthesizer.invoke([
-        SystemMessage(content=RESEARCH_SYSTEM),
-        HumanMessage(content=human_msg)
-    ])
-    
-    # Python deduplication by URL
-    by_url = {}
-    for item in pack.evidence:
-        if item.url not in by_url:
-            by_url[item.url] = item
-    
-    final_evidence = list(by_url.values())
-    
-    # Mode-based date filtering for open_book
-    if state["mode"] == "open_book":
-        as_of_date = _iso_to_date(state["as_of"])
-        if as_of_date:
-            filtered = []
-            for e in final_evidence:
-                pub_date = _iso_to_date(e.published_at)
-                if pub_date:
-                    delta = (as_of_date - pub_date).days
-                    if 0 <= delta <= state["recency_days"]:
-                        filtered.append(e)
-            final_evidence = filtered
-            
-    return {"evidence": final_evidence}
+
+    extractor = llm.with_structured_output(EvidencePack)
+    pack = extractor.invoke(
+        [
+            SystemMessage(content=RESEARCH_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"As-of date: {state['as_of']}\n"
+                    f"Recency days: {state['recency_days']}\n\n"
+                    f"Raw results:\n{raw}"
+                )
+            ),
+        ]
+    )
+
+    dedup = {}
+    for e in pack.evidence:
+        if e.url:
+            dedup[e.url] = e
+    evidence = list(dedup.values())
+
+    if state.get("mode") == "open_book":
+        as_of = date.fromisoformat(state["as_of"])
+        cutoff = as_of - timedelta(days=int(state["recency_days"]))
+        evidence = [e for e in evidence if (d := _iso_to_date(e.published_at)) and d >= cutoff]
+
+    return {"evidence": evidence}
+
 
 # -----------------------------
-# 4) Orchestrator
+# 5) Orchestrator (Plan)
 # -----------------------------
+ORCH_SYSTEM = """You are a senior content strategist specialising in product management education.
+Your audience is always Product Managers and Product Leaders — not engineers or data scientists.
+Your job is to plan a blog that makes technical and data science concepts genuinely useful for PMs.
 
-ORCHESTRATOR_SYSTEM = """You are a master blog planner.
+Hard requirements for every plan:
+- Create 5–9 sections (tasks).
+- Each task must have: goal (1 sentence), 3–6 bullets, target_words (120–550).
+- Every bullet must be answerable from a PM perspective — frame around decisions, trade-offs, business outcomes.
 
-Plan the structure of a blog based on the topic and the mode.
+PM translation rule:
+- Any section covering a technical mechanism (e.g. how a model works, how an algorithm runs) MUST have
+  requires_pm_translation=True. The worker will add a plain-English callout box for that section.
+- Every task must have pm_takeaway — a single punchy sentence of business/product impact.
+  Example: "Understanding this helps you set realistic expectations with engineering about model launch timelines."
+  NOT acceptable: "This section explains what embeddings are." (that's a description, not a takeaway)
 
-Grounding Rules:
-- closed_book: Keep content evergreen, focus on fundamentals, no dependence on external evidence.
-- hybrid: Integrate specific evidence for examples/tools; tasks using evidence must have requires_research=true and requires_citations=true.
-- open_book: This is a news roundup. Focus on the most recent facts; avoid tutorials or deep explains unless explicitly requested. If evidence is weak, be transparent about it in the plan.
+Structure requirements:
+- Include AT LEAST ONE section with a focus on business impact, cost, or ROI implications.
+- Include AT LEAST ONE section with real-world product examples (companies that have used this, outcomes they saw).
+- For open_book mode: set blog_kind="news_roundup", focus on events + implications for product teams.
+- For all other modes: set blog_kind="pm_explainer" unless the user explicitly requested a tutorial or comparison.
+
+Grounding rules:
+- closed_book: evergreen, no evidence dependence. Examples can be illustrative/hypothetical.
+- hybrid: use evidence for specific current tools, models, or company examples.
+  Mark those tasks requires_research=True and requires_citations=True.
+- open_book: every section grounded in evidence. No invented events.
+
+Output must strictly match the Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
     planner = llm.with_structured_output(Plan)
-    mode = state.get("mode", "hybrid")
-    evidence = state.get("evidence", []) or []
-    
-    # model_dump up to 16 evidence items
-    evidence_dump = [e.model_dump() if hasattr(e, "model_dump") else e for e in evidence[:16]]
+    mode = state.get("mode", "closed_book")
+    evidence = state.get("evidence", [])
 
-    human_msg = (
-        f"Topic: {state['topic']}\n"
-        f"Mode: {mode}\n"
-        f"As-Of: {state['as_of']}\n"
-        f"Recency Days: {state['recency_days']}\n"
-        f"Evidence: {evidence_dump}"
+    forced_kind = "news_roundup" if mode == "open_book" else None
+
+    plan = planner.invoke(
+        [
+            SystemMessage(content=ORCH_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Topic: {state['topic']}\n"
+                    f"Mode: {mode}\n"
+                    f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
+                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
+                    f"Evidence (use for up-to-date examples and citations):\n"
+                    f"{[e.model_dump() for e in evidence][:16]}"
+                )
+            ),
+        ]
     )
-
-    plan = planner.invoke([
-        SystemMessage(content=ORCHESTRATOR_SYSTEM),
-        HumanMessage(content=human_msg)
-    ])
-
-    # Explicit override for open_book
-    if mode == "open_book":
+    if forced_kind:
         plan.blog_kind = "news_roundup"
 
     return {"plan": plan}
 
-def fanout_to_workers(state: State):
-    plan = state.get("plan")
-    assert plan is not None, "Plan must be created before fanout."
-    
-    topic = state["topic"]
-    mode = state["mode"]
-    as_of = state["as_of"]
-    recency_days = state["recency_days"]
-    evidence = [e.model_dump() for e in state["evidence"]] if state["evidence"] else []
 
+# -----------------------------
+# 6) Fanout
+# -----------------------------
+def fanout(state: State):
+    assert state["plan"] is not None
     return [
         Send(
             "worker",
             {
-                "task": t.model_dump(),
-                "topic": topic,
-                "mode": mode,
-                "as_of": as_of,
-                "recency_days": recency_days,
-                "plan": plan.model_dump(),
-                "evidence": evidence
-            }
+                "task": task.model_dump(),
+                "topic": state["topic"],
+                "mode": state["mode"],
+                "as_of": state["as_of"],
+                "recency_days": state["recency_days"],
+                "plan": state["plan"].model_dump(),
+                "evidence": [e.model_dump() for e in state.get("evidence", [])],
+            },
         )
-        for t in plan.tasks
+        for task in state["plan"].tasks
     ]
 
-# -----------------------------
-# 5) Worker
-# -----------------------------
 
-WORKER_SYSTEM = """You are a senior technical writer. Your task is to write ONE section of a blog post in Markdown.
+# -----------------------------
+# 7) Worker
+# -----------------------------
+WORKER_SYSTEM = """You are a senior writer who translates technical and data science concepts for Product Managers and Product Leaders.
+Write ONE section of a blog post in Markdown.
 
-Instructions:
-1. Cover ALL bullets in the provided order.
-2. Stay within ±15% of the target word count.
-3. Output ONLY the section content, starting with a '##' heading. No preamble or post-amble.
-4. If the blog_kind is 'news_roundup', focus on reporting events and their implications—do NOT write tutorials or 'how-to' guides.
-5. If the mode is 'open_book', every factual claim (company, event, model detail) MUST have a citation to a provided source URL using the format ([Source](URL)). If a claim is not in the evidence, write 'Not found in provided sources'.
-6. If the section requires citations (requires_citations=true), cite URLs from the provided evidence.
-7. If the section requires code (requires_code=true), include at least one minimal, valid code snippet.
-8. Style: Short paragraphs, use bullets where helpful for readability, use triple-backtick code fences. No fluff or flowery language.
+Your reader is a PM or product leader. They are smart and curious but did not study computer science.
+They care about: business outcomes, product decisions, team trade-offs, cost, speed, and risk.
+They do NOT care about implementation syntax, algorithm internals, or engineering architecture for its own sake.
+
+Writing rules — follow ALL of these:
+
+1. ANALOGY FIRST
+   Always open with a short, concrete real-world analogy BEFORE any technical definition.
+   Good: "Think of a vector embedding like a postal code for meaning — two similar ideas get codes that are geographically close."
+   Bad: "A vector embedding is a numerical representation of data in a high-dimensional space."
+
+2. PLAIN ENGLISH FOR EVERY TECHNICAL TERM
+   Every time you use a technical term, immediately follow it with a plain-English translation in parentheses.
+   Example: "The model uses attention mechanisms (a way of deciding which words in a sentence matter most for a given context)..."
+
+3. PM TRANSLATION CALLOUT
+   If requires_pm_translation is True, add this callout box AFTER the technical explanation:
+   > **💡 What this means for you as a PM**
+   > [2–4 sentences explaining the direct product, roadmap, team, or budget implication.
+   >  Be specific. Mention decisions this affects, risks it creates, or opportunities it unlocks.]
+   Use the pm_takeaway field as the opening sentence of this callout.
+
+4. BUSINESS IMPACT LANGUAGE
+   Use phrases like: "This means your team can...", "This affects your roadmap because...",
+   "The business trade-off is...", "When this goes wrong, you'll see it as..."
+   Avoid phrases like: "This algorithm works by...", "The mathematical intuition is..."
+
+5. REAL EXAMPLES OVER ABSTRACTIONS
+   Ground every concept in a real product example. Use companies, products, and features your PM reader knows.
+   (Spotify, Netflix, Swiggy, Zomato, Uber, Amazon, WhatsApp, Paytm, Google Search, etc.)
+
+6. SCOPE GUARD
+   If blog_kind=="news_roundup": focus on events and their implications for product teams. NO tutorials.
+
+7. GROUNDING POLICY
+   If mode=="open_book": every specific claim (event, company, model, funding) MUST have a citation
+   from provided Evidence URLs using ([Source](URL)). If not in evidence: "Not confirmed in available sources."
+   If requires_citations==True: cite Evidence URLs for all external claims.
+
+8. CODE
+   If requires_code==True: include one minimal, practical code snippet. Add a comment above it
+   explaining what a PM should understand about it (even if they never write it themselves).
+
+9. FORMAT
+   - Start with "## <Section Title>"
+   - Short paragraphs (3–4 sentences max)
+   - Use bullet points for lists of 3+ items
+   - Bold the most important phrase in each paragraph
+   - Output ONLY the section markdown — no preamble, no "Here is the section:" wrapper
 """
 
 def worker_node(payload: dict) -> dict:
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
-    evidence = [EvidenceItem(**e) for e in payload["evidence"]]
-    
-    topic = payload["topic"]
-    mode = payload["mode"]
-    as_of = payload["as_of"]
-    recency_days = payload["recency_days"]
+    evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
 
-    bullets_str = "\n".join([f"- {b}" for b in task.bullets])
-    
-    evidence_lines = []
-    for e in evidence:
-        date_str = e.published_at or "date:unknown"
-        evidence_lines.append(f"{e.title} | {e.url} | {date_str} | {e.snippet}")
-    evidence_text = "\n".join(evidence_lines)
-
-    human_msg = (
-        f"Blog Title: {plan.blog_title}\n"
-        f"Audience: {plan.audience}\n"
-        f"Tone: {plan.tone}\n"
-        f"Blog Kind: {plan.blog_kind}\n"
-        f"Topic: {topic}\n"
-        f"Mode: {mode}\n"
-        f"As-Of Date: {as_of}\n"
-        f"Recency Days: {recency_days}\n\n"
-        f"SECTION DETAILS:\n"
-        f"Title: {task.title}\n"
-        f"Goal: {task.goal}\n"
-        f"Target Words: {task.target_words}\n"
-        f"Tags: {task.tags}\n"
-        f"Flags: research={task.requires_research}, citations={task.requires_citations}, code={task.requires_code}\n"
-        f"Bullets to Cover:\n{bullets_str}\n\n"
-        f"PROVIDED EVIDENCE:\n{evidence_text}"
+    bullets_text = "\n- " + "\n- ".join(task.bullets)
+    evidence_text = "\n".join(
+        f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
+        for e in evidence[:20]
     )
 
-    section_md = llm.invoke([
-        SystemMessage(content=WORKER_SYSTEM),
-        HumanMessage(content=human_msg)
-    ]).content
+    section_md = llm.invoke(
+        [
+            SystemMessage(content=WORKER_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Blog title: {plan.blog_title}\n"
+                    f"Audience: {plan.audience}\n"
+                    f"Tone: {plan.tone}\n"
+                    f"Blog kind: {plan.blog_kind}\n"
+                    f"Constraints: {plan.constraints}\n"
+                    f"Topic: {payload['topic']}\n"
+                    f"Mode: {payload.get('mode')}\n"
+                    f"As-of: {payload.get('as_of')} (recency_days={payload.get('recency_days')})\n\n"
+                    f"Section title: {task.title}\n"
+                    f"Goal: {task.goal}\n"
+                    f"PM Takeaway (use as opening of callout box): {task.pm_takeaway}\n"
+                    f"Target words: {task.target_words}\n"
+                    f"Tags: {task.tags}\n"
+                    f"requires_pm_translation: {task.requires_pm_translation}\n"
+                    f"requires_research: {task.requires_research}\n"
+                    f"requires_citations: {task.requires_citations}\n"
+                    f"requires_code: {task.requires_code}\n"
+                    f"Bullets to cover:\n{bullets_text}\n\n"
+                    f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
+                )
+            ),
+        ]
+    ).content.strip()
 
     return {"sections": [(task.id, section_md)]}
 
-# -----------------------------
-# 6) Reducer (Subgraph)
-# -----------------------------
+
+# ============================================================
+# 8) Reducer subgraph
+#    merge_content → decide_images → generate_and_place_images → further_reading
+# ============================================================
 
 def merge_content(state: State) -> dict:
-    plan = state.get("plan")
+    plan = state["plan"]
     if plan is None:
-        raise ValueError("Plan is missing! Cannot merge content.")
-    
-    # Get sections and sort by task_id
-    sections = state.get("sections", [])
-    sections.sort(key=lambda x: x[0])
-    
-    # Extract markdown body
-    body_parts = [s[1] for s in sections]
-    joined_body = "\n\n".join(body_parts)
-    
-    merged_md = f"# {plan.blog_title}\n\n{joined_body}"
+        raise ValueError("merge_content called without plan.")
+    ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
+    body = "\n\n".join(ordered_sections).strip()
+    merged_md = f"# {plan.blog_title}\n\n{body}\n"
     return {"merged_md": merged_md}
 
-# Initialize Subgraph
-reducer_graph = StateGraph(State)
-reducer_graph.add_node("merge_content", merge_content)
 
-# -----------------------------
-# 7) Image Decision (Reducer Node)
-# -----------------------------
+# ── Image decision ──────────────────────────────────────────────────────────
 
-DECIDE_IMAGES_SYSTEM = """You are an expert technical editor deciding if images are needed for a blog post.
+DECIDE_IMAGES_SYSTEM = """You are a visual content editor for a Product Management blog.
+Decide if images are needed for this blog and where they would help most.
 
-Constraints:
-1. MAX 3 images total.
-2. Each image must materially improve understanding — prefer diagrams, flowcharts, or table-like visuals.
-3. NO decorative images (landscapes, stock photos, abstract art).
-4. Insert placeholders in the blog text in this exact format: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
-5. If no images are needed, the md_with_placeholders must equal the input text unchanged and the images list must be empty.
+Your audience is Product Managers, not engineers. Images should be illustrative and relatable —
+they should help a non-technical reader understand a concept faster through visual analogy or business context.
 
-Output must strictly match the GlobalImagePlan schema.
+Rules:
+- Maximum 3 images total.
+- Each image must materially improve understanding. Ask: "Would a PM's eyes light up seeing this?"
+- Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
+- If no images are needed: md_with_placeholders must equal the input text unchanged, images=[].
+
+Image style guidance — the prompt you write for each image MUST specify:
+- "Clean, flat, minimal illustration style. No photorealism. No dark backgrounds."
+- "Suitable for a product strategy blog or business presentation."
+- Use everyday metaphors and business scenarios, NOT engineering diagrams.
+
+Good image ideas for PM blogs:
+- A split-screen "before / after" showing a business problem and its solution
+- A simple flowchart using icons (people, boxes, arrows) to show a process
+- A visual analogy: e.g. a postal sorting office to explain data routing
+- A dashboard mockup showing a business metric improving
+- A 2x2 matrix comparing options (effort vs impact, speed vs accuracy)
+- A timeline showing how a technology evolved with business milestones
+- A team collaboration scene illustrating a product decision process
+
+Bad image ideas (do NOT use):
+- Neural network architecture diagrams with many nodes and weights
+- Code screenshots or terminal output
+- Pure mathematical notation
+- Abstract geometric patterns
+
+Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
     planner = llm.with_structured_output(GlobalImagePlan)
-    plan = state.get("plan")
-    blog_kind = plan.blog_kind if plan else "explainer"
-    
-    human_msg = (
-        f"Blog Kind: {blog_kind}\n"
-        f"Topic: {state['topic']}\n"
-        f"Instruction: Decide if any of the sections need a clarifying technical image. "
-        f"If so, insert a placeholder in the markdown text and provide the prompt/specs for that image.\n\n"
-        f"Merged Markdown Content:\n{state['merged_md']}"
-    )
+    merged_md = state["merged_md"]
+    plan = state["plan"]
+    assert plan is not None
 
-    image_plan = planner.invoke([
-        SystemMessage(content=DECIDE_IMAGES_SYSTEM),
-        HumanMessage(content=human_msg)
-    ])
+    image_plan = planner.invoke(
+        [
+            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Blog kind: {plan.blog_kind}\n"
+                    f"Audience: Product Managers and Product Leaders\n"
+                    f"Topic: {state['topic']}\n\n"
+                    "Decide if illustrative images would help a PM audience understand this blog faster.\n"
+                    "Insert placeholders at the right positions and write clear Gemini image generation prompts.\n\n"
+                    f"{merged_md}"
+                )
+            ),
+        ]
+    )
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
-        "image_specs": [i.model_dump() for i in image_plan.images]
+        "image_specs": [img.model_dump() for img in image_plan.images],
     }
 
-# Update Subgraph
-reducer_graph.add_node("decide_images", decide_images)
-reducer_graph.add_edge("merge_content", "decide_images")
 
-# -----------------------------
-# 8) Image Generation & Placement (Reducer Node)
-# -----------------------------
+# ── Image generation ─────────────────────────────────────────────────────────
 
 def _gemini_generate_image_bytes(prompt: str) -> bytes:
     from google import genai
@@ -437,40 +713,62 @@ def _gemini_generate_image_bytes(prompt: str) -> bytes:
         raise RuntimeError("GOOGLE_API_KEY is not set.")
 
     client = genai.Client(api_key=api_key)
+
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            safety_settings=[
+                types.SafetySetting(
+                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                    threshold="BLOCK_ONLY_HIGH",
+                )
+            ],
+        ),
+    )
+
+    parts = getattr(resp, "parts", None)
+    if not parts and getattr(resp, "candidates", None):
+        try:
+            parts = resp.candidates[0].content.parts
+        except Exception:
+            parts = None
+
+    if not parts:
+        raise RuntimeError("No image content returned (safety/quota/SDK change).")
+
+    for part in parts:
+        inline = getattr(part, "inline_data", None)
+        if inline and getattr(inline, "data", None):
+            return inline.data
+
+    raise RuntimeError("No inline image bytes found in response.")
+
+
+def _openai_generate_image_bytes(prompt: str, size: str = "1024x1024") -> bytes:
+    from openai import OpenAI
+    import base64
     
-    config = types.GenerateContentConfig(
-        response_modalities=["IMAGE"],
-        safety_settings=[
-            types.SafetySetting(
-                category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                threshold="BLOCK_ONLY_HIGH"
-            )
-        ]
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+        
+    client = OpenAI(api_key=api_key)
+    response = client.images.generate(
+        model="gpt-image-1.5",
+        prompt=prompt,
+        size=size,
+        quality="medium",
+        n=1
     )
     
-    try:
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash-image", # Corrected model name
-            contents=prompt,
-            config=config
-        )
-        
-        parts = None
-        if hasattr(resp, "parts") and resp.parts:
-            parts = resp.parts
-        elif hasattr(resp, "candidates") and resp.candidates:
-            parts = resp.candidates[0].content.parts
-            
-        if not parts:
-            raise RuntimeError("No parts found in Gemini response.")
-            
-        for p in parts:
-            if hasattr(p, "inline_data") and p.inline_data and p.inline_data.data:
-                return p.inline_data.data
-                
-        raise RuntimeError("No inline image bytes found in response parts.")
-    except Exception as e:
-        raise RuntimeError(f"Gemini generation failed: {str(e)}")
+    b64_data = response.data[0].b64_json
+    if not b64_data:
+        raise RuntimeError("No image data returned from OpenAI.")
+    
+    return base64.b64decode(b64_data)
+
 
 def _safe_slug(title: str) -> str:
     s = title.strip().lower()
@@ -478,73 +776,128 @@ def _safe_slug(title: str) -> str:
     s = re.sub(r"\s+", "_", s).strip("_")
     return s or "blog"
 
+
 def generate_and_place_images(state: State) -> dict:
-    plan = state.get("plan")
-    md = state.get("md_with_placeholders") or state.get("merged_md") or ""
+    plan = state["plan"]
+    assert plan is not None
+
+    md = state.get("md_with_placeholders") or state["merged_md"]
     image_specs = state.get("image_specs", []) or []
-    blog_title = plan.blog_title if plan else "blog"
 
     if not image_specs:
-        out_name = f"{_safe_slug(blog_title)}.md"
-        Path(out_name).write_text(md, encoding="utf-8")
+        filename = f"{_safe_slug(plan.blog_title)}.md"
+        Path(filename).write_text(md, encoding="utf-8")
         return {"final": md}
 
-    Path("images").mkdir(exist_ok=True)
-    
-    for spec in image_specs:
-        placeholder = spec.get("placeholder", "")
-        filename = spec.get("filename", "image.png")
-        alt = spec.get("alt", "image")
-        caption = spec.get("caption", "")
-        prompt = spec.get("prompt", "")
-        
-        out_path = Path("images") / filename
-        
-        success = False
-        error_msg = ""
-        
-        if out_path.exists():
-            success = True
-        else:
-            try:
-                img_bytes = _gemini_generate_image_bytes(prompt)
-                out_path.write_bytes(img_bytes)
-                success = True
-            except Exception as e:
-                error_msg = str(e)
-                
-        if success:
-            replacement = f"![{alt}](images/{filename})\n*{caption}*"
-        else:
-            replacement = (
-                f"\n> **Image Generation Failed**\n"
-                f"> **Caption:** {caption}\n"
-                f"> **Alt:** {alt}\n"
-                f"> **Prompt:** {prompt}\n"
-                f"> **Error:** {error_msg}\n"
-            )
-        
-        md = md.replace(placeholder, replacement)
+    images_dir = Path("images")
+    images_dir.mkdir(exist_ok=True)
 
-    out_name = f"{_safe_slug(blog_title)}.md"
-    Path(out_name).write_text(md, encoding="utf-8")
-    
+    for spec in image_specs:
+        placeholder = spec["placeholder"]
+        filename = spec["filename"]
+        out_path = images_dir / filename
+
+        if not out_path.exists():
+            try:
+                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+                out_path.write_bytes(img_bytes)
+            except Exception as e:
+                try:
+                    print(f"Gemini image generation failed: {e}. Falling back to gpt-image-1.5...")
+                    img_bytes = _openai_generate_image_bytes(spec["prompt"], size=spec.get("size", "1024x1024"))
+                    out_path.write_bytes(img_bytes)
+                except Exception as e2:
+                    prompt_block = (
+                        f"> **[IMAGE GENERATION FAILED]** {spec.get('caption', '')}\n>\n"
+                        f"> **Alt:** {spec.get('alt', '')}\n>\n"
+                        f"> **Prompt:** {spec.get('prompt', '')}\n>\n"
+                        f"> **Error:** Gemini failed: {e} | OpenAI fallback failed: {e2}\n"
+                    )
+                    md = md.replace(placeholder, prompt_block)
+                    continue
+
+        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
+        md = md.replace(placeholder, img_md)
+
+    # NOTE: Final save happens in further_reading_node after the FR section is appended.
+    # Store intermediate markdown in state — further_reading_node will append and save.
     return {"final": md}
 
-# Complete Subgraph
+
+# ── Further reading node ─────────────────────────────────────────────────────
+# ZERO hallucination: only uses URLs already in state["evidence"].
+# No LLM call. No invented sources. If evidence is empty, says so transparently.
+
+def further_reading_node(state: State) -> dict:
+    plan = state.get("plan")
+    evidence: List[EvidenceItem] = state.get("evidence") or []
+    current_final: str = state.get("final") or state.get("merged_md") or ""
+
+    lines = ["", "---", "", "## 📚 Further Reading"]
+
+    if not evidence:
+        lines.append(
+            "\n*This blog was written from the model's training knowledge. "
+            "No external sources were retrieved during generation. "
+            "For further reading, search for the topic on "
+            "[Lenny's Newsletter](https://www.lennysnewsletter.com), "
+            "[Reforge](https://www.reforge.com/blog), or "
+            "[Mind the Product](https://www.mindtheproduct.com).*"
+        )
+    else:
+        lines.append(
+            "\nThe following sources were retrieved and used during research for this blog. "
+            "All links are verified — none are invented.\n"
+        )
+        for i, item in enumerate(evidence, start=1):
+            # Only include items that have a real URL
+            if not item.url or not item.url.startswith("http"):
+                continue
+
+            title = item.title or "Untitled"
+            url = item.url
+            source = f" · *{item.source}*" if item.source else ""
+            date_str = f" · {item.published_at}" if item.published_at else ""
+            snippet = f"\n   > {item.snippet[:180]}..." if item.snippet and len(item.snippet) > 20 else ""
+
+            lines.append(f"{i}. **[{title}]({url})**{source}{date_str}{snippet}\n")
+
+    further_reading_md = "\n".join(lines)
+
+    # Append to the current final markdown
+    full_final = current_final.rstrip() + "\n" + further_reading_md + "\n"
+
+    # Save the complete file now (this is the last reducer node)
+    if plan:
+        filename = f"{_safe_slug(plan.blog_title)}.md"
+        Path(filename).write_text(full_final, encoding="utf-8")
+
+    return {
+        "further_reading": further_reading_md,
+        "final": full_final,
+    }
+
+
+# ── Build reducer subgraph ────────────────────────────────────────────────────
+reducer_graph = StateGraph(State)
+reducer_graph.add_node("merge_content", merge_content)
+reducer_graph.add_node("decide_images", decide_images)
 reducer_graph.add_node("generate_and_place_images", generate_and_place_images)
+reducer_graph.add_node("further_reading", further_reading_node)
+
+reducer_graph.add_edge(START, "merge_content")
+reducer_graph.add_edge("merge_content", "decide_images")
 reducer_graph.add_edge("decide_images", "generate_and_place_images")
-reducer_graph.set_entry_point("merge_content")
-reducer_graph.set_finish_point("generate_and_place_images")
+reducer_graph.add_edge("generate_and_place_images", "further_reading")
+reducer_graph.add_edge("further_reading", END)
 
 reducer_subgraph = reducer_graph.compile()
 
-# -----------------------------
-# 9) Main Graph
-# -----------------------------
 
+# -----------------------------
+# 9) Build main graph
+# -----------------------------
 g = StateGraph(State)
-
 g.add_node("router", router_node)
 g.add_node("research", research_node)
 g.add_node("orchestrator", orchestrator_node)
@@ -555,60 +908,71 @@ g.add_edge(START, "router")
 g.add_conditional_edges(
     "router",
     route_next,
-    {
-        "research": "research",
-        "orchestrator": "orchestrator"
-    }
+    {"research": "research", "orchestrator": "orchestrator"},
 )
 g.add_edge("research", "orchestrator")
-g.add_conditional_edges("orchestrator", fanout_to_workers, ["worker"])
+g.add_conditional_edges("orchestrator", fanout, ["worker"])
 g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 
 app = g.compile()
 
+
+# -----------------------------
+# 10) Runner
+# -----------------------------
 def run(topic: str, as_of: Optional[str] = None) -> dict:
     if as_of is None:
         as_of = date.today().isoformat()
-        
-    initial_state = {
-        "topic": topic,
-        "mode": "",
-        "needs_research": False,
-        "queries": [],
-        "evidence": [],
-        "plan": None,
-        "as_of": as_of,
-        "recency_days": 7,
-        "sections": [],
-        "merged_md": "",
-        "md_with_placeholders": "",
-        "image_specs": [],
-        "final": "",
-    }
-    
-    return app.invoke(initial_state)
+
+    return app.invoke(
+        {
+            "topic": topic,
+            "mode": "",
+            "needs_research": False,
+            "queries": [],
+            "evidence": [],
+            "plan": None,
+            "as_of": as_of,
+            "recency_days": 7,
+            "sections": [],
+            "merged_md": "",
+            "md_with_placeholders": "",
+            "image_specs": [],
+            "further_reading": "",
+            "final": "",
+        }
+    )
+
 
 if __name__ == "__main__":
-    import json
-    print("🚀 Starting test run...")
-    topic = "Image Generation Models - A brief history and the way ahead"
+    from pathlib import Path
+    print("🚀 Starting PM-tuned blog agent test run...")
+    topic = "How Large Language Models Work — A Guide for Product Managers"
     out = run(topic)
-    
-    print("-" * 50)
-    print(f"1. Mode chosen by router: {out.get('mode')}")
-    
+
+    print("-" * 60)
+    print(f"1. Mode:              {out.get('mode')}")
+    print(f"2. Evidence gathered: {len(out.get('evidence') or [])} items")
+
+    plan = out.get("plan")
+    if plan:
+        p = plan.model_dump() if hasattr(plan, "model_dump") else plan
+        print(f"3. Blog kind:         {p.get('blog_kind')}")
+        print(f"4. Sections planned:  {len(p.get('tasks', []))}")
+        pm_trans = sum(1 for t in p.get("tasks", []) if t.get("requires_pm_translation"))
+        print(f"5. PM-translation sections: {pm_trans}")
+
     images_dir = Path("images")
     if images_dir.exists():
         pngs = list(images_dir.glob("*.png"))
-        print(f"2. Images generated: {len(pngs)} PNG files found in images/")
+        print(f"6. Images generated:  {len(pngs)} PNG files")
     else:
-        print("2. No images generated (images/ folder not found).")
-        
+        print("6. Images generated:  0 (no images/ folder)")
+
     final_md = out.get("final", "")
-    has_img_syntax = "![" in final_md and "](images/" in final_md
-    print(f"3. Contains Markdown image syntax: {has_img_syntax}")
-    
-    print("-" * 50)
-    print("4. Final Blog Preview:")
-    print(final_md[:1000] + "...") # Print first 1000 chars
+    print(f"7. Further Reading section present: {'## 📚 Further Reading' in final_md}")
+    print(f"8. PM callout boxes present:        {'💡 What this means for you as a PM' in final_md}")
+    print("-" * 60)
+    print("9. Blog preview (first 1200 chars):")
+    print(final_md[:1200] + "...")

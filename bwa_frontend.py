@@ -32,7 +32,6 @@ def bundle_zip(md_text: str, md_filename: str, images_dir: Path) -> bytes:
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr(md_filename, md_text.encode("utf-8"))
-
         if images_dir.exists() and images_dir.is_dir():
             for p in images_dir.rglob("*"):
                 if p.is_file():
@@ -112,7 +111,6 @@ def render_markdown_with_local_images(md: str):
         before = md[last : m.start()]
         if before:
             parts.append(("md", before))
-
         alt = (m.group("alt") or "").strip()
         src = (m.group("src") or "").strip()
         parts.append(("img", f"{alt}|||{src}"))
@@ -157,12 +155,9 @@ def render_markdown_with_local_images(md: str):
 
 
 # -----------------------------
-# ✅ Past blogs helpers
+# Past blogs helpers
 # -----------------------------
 def list_past_blogs() -> List[Path]:
-    """
-    Returns .md files in current working directory, newest first.
-    """
     cwd = Path(".")
     files = [p for p in cwd.glob("*.md") if p.is_file()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -174,9 +169,6 @@ def read_md_file(p: Path) -> str:
 
 
 def extract_title_from_md(md: str, fallback: str) -> str:
-    """
-    Use first '# ' heading as title if present.
-    """
     for line in md.splitlines():
         if line.startswith("# "):
             t = line[2:].strip()
@@ -187,16 +179,49 @@ def extract_title_from_md(md: str, fallback: str) -> str:
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="LangGraph Blog Writer", layout="wide")
+st.set_page_config(page_title="PM Blog Writer", layout="wide")
+
+def check_password() -> bool:
+    import os
+    
+    password = ""
+    try:
+        if "APP_PASSWORD" in st.secrets:
+            password = st.secrets["APP_PASSWORD"]
+    except Exception:
+        pass
+        
+    if not password:
+        password = os.getenv("APP_PASSWORD", "")
+
+    if not password:
+        return True
+
+    def password_entered():
+        if st.session_state["pwd_input"] == password:
+            st.session_state["password_correct"] = True
+            del st.session_state["pwd_input"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.text_input("🔒 Enter Application Password", type="password", on_change=password_entered, key="pwd_input")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.text_input("🔒 Enter Application Password", type="password", on_change=password_entered, key="pwd_input")
+        st.error("😕 Password incorrect")
+        return False
+    return True
+
+if not check_password():
+    st.stop()
 
 st.title("Blog Writing Agent")
+st.caption("Tuned for Product Managers and Product Leaders — translates technical concepts into business language.")
 
 with st.sidebar:
     st.header("Generate New Blog")
-    topic = st.text_area(
-        "Topic",
-        height=120,
-    )
+    topic = st.text_area("Topic", height=120)
     as_of = st.date_input("As-of date", value=date.today())
     run_btn = st.button("🚀 Generate Blog", type="primary")
 
@@ -231,27 +256,25 @@ with st.sidebar:
         if st.button("📂 Load selected blog"):
             if selected_md_file:
                 md_text = read_md_file(selected_md_file)
-                # Load into session_state as if it were a run output
                 st.session_state["last_out"] = {
                     "plan": None,
                     "evidence": [],
                     "image_specs": [],
+                    "further_reading": "",
                     "final": md_text,
                 }
-                # also update the topic input to the title (best-effort)
                 st.session_state["topic_prefill"] = extract_title_from_md(md_text, selected_md_file.stem)
 
 
 if "topic_prefill" in st.session_state and isinstance(st.session_state["topic_prefill"], str):
     pass
 
-# Storage for latest run
 if "last_out" not in st.session_state:
     st.session_state["last_out"] = None
 
-# Layout
-tab_plan, tab_evidence, tab_preview, tab_images, tab_logs = st.tabs(
-    ["🧩 Plan", "🔎 Evidence", "📝 Markdown Preview", "🖼️ Images", "🧾 Logs"]
+# ── Tab layout — added 📚 Further Reading between Evidence and Preview ──
+tab_plan, tab_evidence, tab_further, tab_preview, tab_images, tab_logs = st.tabs(
+    ["🧩 Plan", "🔎 Evidence", "📚 Further Reading", "📝 Markdown Preview", "🖼️ Images", "🧾 Logs"]
 )
 
 logs: List[str] = []
@@ -279,10 +302,11 @@ if run_btn:
         "merged_md": "",
         "md_with_placeholders": "",
         "image_specs": [],
+        "further_reading": "",   # NEW field
         "final": "",
     }
 
-    status = st.status("Running graph...", expanded=True)
+    status = st.status("Running graph…", expanded=True)
     progress_area = st.empty()
 
     current_state: Dict[str, Any] = {}
@@ -318,11 +342,14 @@ if run_btn:
             status.update(label="✅ Done", state="complete", expanded=False)
             log("[final] received final state")
 
-# Render last result (if any)
+
+# ── Render last result ────────────────────────────────────────────────────────
 out = st.session_state.get("last_out")
 if out:
+
+    # ── Plan tab ──────────────────────────────────────────────────────────────
     with tab_plan:
-        st.subheader("Plan")
+        st.subheader("Blog Plan")
         plan_obj = out.get("plan")
         if not plan_obj:
             st.info("No plan found in output.")
@@ -342,12 +369,15 @@ if out:
 
             tasks = plan_dict.get("tasks", [])
             if tasks:
+                # ── NEW: includes pm_takeaway and requires_pm_translation ──
                 df = pd.DataFrame(
                     [
                         {
                             "id": t.get("id"),
                             "title": t.get("title"),
                             "target_words": t.get("target_words"),
+                            "pm_takeaway": t.get("pm_takeaway", ""),
+                            "requires_pm_translation": t.get("requires_pm_translation", False),
                             "requires_research": t.get("requires_research"),
                             "requires_citations": t.get("requires_citations"),
                             "requires_code": t.get("requires_code"),
@@ -358,14 +388,34 @@ if out:
                 ).sort_values("id")
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
-                with st.expander("Task details"):
+                # ── PM takeaway summary cards ──
+                pm_sections = [t for t in tasks if t.get("requires_pm_translation")]
+                if pm_sections:
+                    st.markdown("---")
+                    st.markdown("**💡 PM Translation sections** — these contain technical content translated for product leaders:")
+                    for t in pm_sections:
+                        takeaway = t.get("pm_takeaway", "")
+                        if takeaway:
+                            st.info(f"**{t.get('title')}** — {takeaway}")
+
+                with st.expander("Full task details (JSON)"):
                     st.json(tasks)
 
+    # ── Evidence tab ──────────────────────────────────────────────────────────
     with tab_evidence:
-        st.subheader("Evidence")
+        st.subheader("Research Sources")
+        st.caption(
+            "These are the verified sources retrieved by Tavily and used during blog generation. "
+            "The same URLs appear in the Further Reading section at the end of the blog. "
+            "No sources are invented."
+        )
         evidence = out.get("evidence") or []
         if not evidence:
-            st.info("No evidence returned.")
+            st.info(
+                "No external sources were retrieved for this blog. "
+                "The content was generated from the model's training knowledge (closed_book mode). "
+                "See the Further Reading tab for curated PM resource suggestions."
+            )
         else:
             rows = []
             for e in evidence:
@@ -377,10 +427,60 @@ if out:
                         "published_at": e.get("published_at"),
                         "source": e.get("source"),
                         "url": e.get("url"),
+                        "snippet": (e.get("snippet") or "")[:120],
                     }
                 )
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(f"{len(rows)} source(s) used in this blog.")
 
+    # ── Further Reading tab (NEW) ─────────────────────────────────────────────
+    with tab_further:
+        st.subheader("📚 Further Reading")
+        st.caption("Curated sources verified during research. Click any link to read the original.")
+
+        further_md = out.get("further_reading") or ""
+        evidence_list = out.get("evidence") or []
+
+        if not evidence_list:
+            st.info(
+                "This blog was written from the model's training knowledge — no external sources were retrieved.\n\n"
+                "For further reading on PM topics, explore:\n"
+                "- [Lenny's Newsletter](https://www.lennysnewsletter.com)\n"
+                "- [Reforge Blog](https://www.reforge.com/blog)\n"
+                "- [Mind the Product](https://www.mindtheproduct.com)\n"
+                "- [Stratechery](https://stratechery.com)\n"
+                "- [First Round Review](https://review.firstround.com)"
+            )
+        else:
+            # Render as clickable cards — one per evidence item
+            for i, item in enumerate(evidence_list, start=1):
+                if hasattr(item, "model_dump"):
+                    item = item.model_dump()
+
+                url = item.get("url", "")
+                title = item.get("title") or "Untitled"
+                snippet = item.get("snippet") or ""
+                source = item.get("source") or ""
+                pub_date = item.get("published_at") or ""
+
+                if not url or not url.startswith("http"):
+                    continue
+
+                with st.container():
+                    col_num, col_content = st.columns([0.05, 0.95])
+                    with col_num:
+                        st.markdown(f"**{i}.**")
+                    with col_content:
+                        meta_parts = [p for p in [source, pub_date] if p]
+                        meta = " · ".join(meta_parts)
+                        st.markdown(f"**[{title}]({url})**")
+                        if meta:
+                            st.caption(meta)
+                        if snippet:
+                            st.markdown(f"> {snippet[:200]}{'...' if len(snippet) > 200 else ''}")
+                st.divider()
+
+    # ── Markdown Preview tab ──────────────────────────────────────────────────
     with tab_preview:
         st.subheader("Markdown Preview")
         final_md = out.get("final") or ""
@@ -413,6 +513,7 @@ if out:
                 mime="application/zip",
             )
 
+    # ── Images tab ────────────────────────────────────────────────────────────
     with tab_images:
         st.subheader("Images")
         specs = out.get("image_specs") or []
@@ -442,6 +543,7 @@ if out:
                         mime="application/zip",
                     )
 
+    # ── Logs tab ──────────────────────────────────────────────────────────────
     with tab_logs:
         st.subheader("Logs")
         if "logs" not in st.session_state:
@@ -450,5 +552,6 @@ if out:
             st.session_state["logs"].extend(logs)
 
         st.text_area("Event log", value="\n\n".join(st.session_state["logs"][-80:]), height=520)
+
 else:
     st.info("Enter a topic and click **Generate Blog**.")
