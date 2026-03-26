@@ -16,6 +16,7 @@ import streamlit as st
 # Import your compiled LangGraph app
 # -----------------------------
 from bwa_backend import app
+from github_utils import push_to_github
 
 
 # -----------------------------
@@ -224,6 +225,26 @@ with st.sidebar:
     topic = st.text_area("Topic", height=120)
     as_of = st.date_input("As-of date", value=date.today())
     run_btn = st.button("🚀 Generate Blog", type="primary")
+
+    st.divider()
+    st.subheader("GitHub Settings")
+    gh_repo = st.text_input("Repository (user/repo)", value=os.getenv("GITHUB_REPO", "ashumishra2104/Blogs-for-Product-Managers-and-Leaders-"))
+    gh_branch = st.text_input("Branch", value=os.getenv("GITHUB_BRANCH", "main"))
+    
+    # Try to get token from secrets/env
+    gh_token = ""
+    try:
+        if "GITHUB_TOKEN" in st.secrets:
+            gh_token = st.secrets["GITHUB_TOKEN"]
+    except Exception:
+        pass
+    if not gh_token:
+        gh_token = os.getenv("GITHUB_TOKEN", "")
+    
+    gh_token_input = st.text_input("GitHub Token", value=gh_token if gh_token else "", type="password", help="Needed if not set in environment/secrets")
+    
+    if not gh_token_input:
+        st.info("💡 Set `GITHUB_TOKEN` in secrets or enter it above to enable 'Push to GitHub'.")
 
     st.divider()
     st.subheader("Past blogs")
@@ -512,6 +533,29 @@ if out:
                 file_name=f"{safe_slug(blog_title)}_bundle.zip",
                 mime="application/zip",
             )
+
+            st.markdown("---")
+            st.subheader("🚀 Push to GitHub")
+            if not gh_token_input:
+                st.warning("Please provide a GitHub Token in the sidebar to use this feature.")
+            else:
+                commit_msg = st.text_input("Commit Message", value=f"Add blog post: {blog_title}")
+                if st.button("📤 Push to GitHub Repository", type="primary"):
+                    with st.spinner("Pushing to GitHub..."):
+                        try:
+                            github_url = push_to_github(
+                                repo_name=gh_repo,
+                                branch=gh_branch,
+                                token=gh_token_input,
+                                md_content=final_md,
+                                md_filename=md_filename,
+                                commit_message=commit_msg
+                            )
+                            st.success(f"🎉 Successfully pushed to GitHub!")
+                            st.markdown(f"**View file:** [{github_url}]({github_url})")
+                        except Exception as e:
+                            st.error(f"Failed to push to GitHub: {str(e)}")
+                            st.exception(e)
 
     # ── Images tab ────────────────────────────────────────────────────────────
     with tab_images:

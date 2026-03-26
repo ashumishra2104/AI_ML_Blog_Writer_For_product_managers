@@ -9,3 +9,5 @@ pandas
 pypdf
 wikipedia
 duckduckgo-search
+requests
+PyGithub
