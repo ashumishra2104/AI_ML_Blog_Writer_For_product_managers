@@ -1,10 +1,38 @@
-import os
+import io
 import re
 import base64
-import textwrap
 from pathlib import Path
 from typing import List, Optional
 from github import Github, GithubException, InputGitTreeElement
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image compression helper — keeps images under 150 KB for fast GH Pages deploy
+# ─────────────────────────────────────────────────────────────────────────────
+def _compress_image(raw: bytes, max_bytes: int = 150_000) -> bytes:
+    """
+    Compress a PNG/JPEG image to stay under max_bytes.
+    Uses Pillow if available, otherwise returns raw bytes unchanged.
+    """
+    if len(raw) <= max_bytes:
+        return raw
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        quality = 85
+        while quality >= 20:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            if buf.tell() <= max_bytes:
+                return buf.getvalue()
+            quality -= 10
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=20, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -16,7 +44,6 @@ def _get_repo_and_ref(g: "Github", repo_name: str, branch: str):
     except GithubException as e:
         raise Exception(f"Could not access repository '{repo_name}': {e.data.get('message', str(e))}")
 
-    # Initialise empty repo if needed
     try:
         repo.get_contents("/")
     except GithubException as e:
@@ -30,7 +57,6 @@ def _get_repo_and_ref(g: "Github", repo_name: str, branch: str):
         else:
             raise e
 
-    # Resolve branch ref
     try:
         ref = repo.get_git_ref(f"heads/{branch}")
         base_tree = repo.get_git_tree(ref.object.sha)
@@ -60,14 +86,11 @@ def push_to_github(
 ) -> str:
     """
     Pushes a markdown file and its referenced images to a GitHub repository.
-    Handles empty repositories by performing an initial commit if needed.
     """
     g = Github(token)
     repo, ref, base_tree = _get_repo_and_ref(g, repo_name, branch)
 
     elements = []
-
-    # Markdown file
     elements.append(InputGitTreeElement(
         path=md_filename,
         mode="100644",
@@ -75,7 +98,6 @@ def push_to_github(
         content=md_content,
     ))
 
-    # Images referenced in the markdown
     img_matches = re.findall(r"!\[.*?\]\((images/.*?)\)", md_content)
     for img_path_str in img_matches:
         img_path = Path(img_path_str)
@@ -94,7 +116,6 @@ def push_to_github(
     parent   = repo.get_git_commit(ref.object.sha)
     commit   = repo.create_git_commit(commit_message, new_tree, [parent])
     ref.edit(commit.sha)
-
     return f"https://github.com/{repo_name}/blob/{branch}/{md_filename}"
 
 
@@ -104,7 +125,6 @@ def push_to_github(
 def _md_to_html(md: str, blog_title: str, slug: str) -> str:
     """Convert markdown to a full Design B styled HTML page."""
 
-    # --- Extract first paragraph as lede ---
     lede = ""
     body_lines = []
     past_title = False
@@ -119,7 +139,14 @@ def _md_to_html(md: str, blog_title: str, slug: str) -> str:
 
     body_md = "\n".join(body_lines)
 
-    # --- Convert markdown to HTML body ---
+    def _inline_md(text: str) -> str:
+        text = re.sub(r"\*\*\*(.*?)\*\*\*", r"<strong><em>\1</em></strong>", text)
+        text = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", text)
+        text = re.sub(r"\*(.*?)\*", r"<em>\1</em>", text)
+        text = re.sub(r"`(.*?)`", r"<code>\1</code>", text)
+        text = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', text)
+        return text
+
     def convert_md_body(text: str) -> str:
         html_parts = []
         lines = text.splitlines()
@@ -127,13 +154,11 @@ def _md_to_html(md: str, blog_title: str, slug: str) -> str:
         while i < len(lines):
             line = lines[i]
 
-            # Images — path is relative to index.html which sits at blogs/<slug>/
-            # Images are at blogs/<slug>/images/ so src="images/filename.png" is correct
             img_match = re.match(r"!\[(.*?)\]\((images/.*?)\)", line.strip())
             if img_match:
                 alt = img_match.group(1)
-                src = img_match.group(2)        # e.g. "images/foo.png"
-                img_filename = Path(src).name   # e.g. "foo.png"
+                src = img_match.group(2)
+                img_filename = Path(src).name
                 html_parts.append(
                     f'<figure class="blog-figure">'
                     f'<img src="images/{img_filename}" alt="{alt}" class="blog-img">'
@@ -142,19 +167,16 @@ def _md_to_html(md: str, blog_title: str, slug: str) -> str:
                 i += 1
                 continue
 
-            # h2
             if line.startswith("## "):
                 html_parts.append(f'<h2 class="blog-h2">{line[3:].strip()}</h2>')
                 i += 1
                 continue
 
-            # h3
             if line.startswith("### "):
                 html_parts.append(f'<h3 class="blog-h3">{line[4:].strip()}</h3>')
                 i += 1
                 continue
 
-            # Bullet list
             if line.startswith("- ") or line.startswith("* "):
                 items = []
                 while i < len(lines) and (lines[i].startswith("- ") or lines[i].startswith("* ")):
@@ -163,7 +185,6 @@ def _md_to_html(md: str, blog_title: str, slug: str) -> str:
                 html_parts.append(f'<ul class="blog-ul">{"".join(items)}</ul>')
                 continue
 
-            # Numbered list
             if re.match(r"^\d+\. ", line):
                 items = []
                 while i < len(lines) and re.match(r"^\d+\. ", lines[i]):
@@ -172,38 +193,24 @@ def _md_to_html(md: str, blog_title: str, slug: str) -> str:
                 html_parts.append(f'<ol class="blog-ol">{"".join(items)}</ol>')
                 continue
 
-            # Blockquote / callout
             if line.startswith("> "):
-                html_parts.append(
-                    f'<blockquote class="blog-callout">{_inline_md(line[2:])}</blockquote>'
-                )
+                html_parts.append(f'<blockquote class="blog-callout">{_inline_md(line[2:])}</blockquote>')
                 i += 1
                 continue
 
-            # Horizontal rule
             if line.strip() in ("---", "***", "___"):
                 html_parts.append('<hr class="blog-hr">')
                 i += 1
                 continue
 
-            # Empty line
             if not line.strip():
                 i += 1
                 continue
 
-            # Normal paragraph
             html_parts.append(f'<p class="blog-p">{_inline_md(line.strip())}</p>')
             i += 1
 
         return "\n".join(html_parts)
-
-    def _inline_md(text: str) -> str:
-        text = re.sub(r"\*\*\*(.*?)\*\*\*", r"<strong><em>\1</em></strong>", text)
-        text = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", text)
-        text = re.sub(r"\*(.*?)\*", r"<em>\1</em>", text)
-        text = re.sub(r"`(.*?)`", r"<code>\1</code>", text)
-        text = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', text)
-        return text
 
     body_html = convert_md_body(body_md)
     lede_html = _inline_md(lede) if lede else ""
@@ -222,20 +229,11 @@ def _md_to_html(md: str, blog_title: str, slug: str) -> str:
 <style>
 *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
 :root{{
-  --bg:#f9f8f5;
-  --surface:#ffffff;
-  --border:#e8e6df;
-  --border2:#d4d1c8;
-  --accent:#1a1a2e;
-  --accent2:#e85d26;
-  --text:#1a1a2e;
-  --muted:#6b6878;
-  --faint:#a8a5b0;
-  --tag-bg:#f0ede6;
-  --font-display:'Fraunces',serif;
-  --font-body:'Plus Jakarta Sans',sans-serif;
-  --font-mono:'JetBrains Mono',monospace;
-  --font-serif:Georgia,serif;
+  --bg:#f9f8f5;--surface:#ffffff;--border:#e8e6df;--border2:#d4d1c8;
+  --accent:#1a1a2e;--accent2:#e85d26;--text:#1a1a2e;--muted:#6b6878;
+  --faint:#a8a5b0;--tag-bg:#f0ede6;
+  --font-display:'Fraunces',serif;--font-body:'Plus Jakarta Sans',sans-serif;
+  --font-mono:'JetBrains Mono',monospace;--font-serif:Georgia,serif;
   --content-width:720px;
 }}
 html{{scroll-behavior:smooth}}
@@ -285,12 +283,10 @@ a:hover{{text-decoration:underline}}
 </style>
 </head>
 <body>
-
 <nav>
   <a href="../../" class="nav-logo">AM<span>.</span></a>
   <a href="../" class="nav-back">← All Blogs</a>
 </nav>
-
 <div class="blog-hero">
   <div class="blog-tag-row">
     <span class="blog-tag">Product Management</span>
@@ -304,22 +300,19 @@ a:hover{{text-decoration:underline}}
   </div>
   {f'<p class="blog-lede">{lede_html}</p>' if lede_html else ''}
 </div>
-
 <div class="blog-body">
 {body_html}
 </div>
-
 <footer class="blog-footer">
   <p>© 2026 Ashu Mishra · Delhi, India</p>
   <p><a href="../">← Back to Blogs</a></p>
 </footer>
-
 </body>
 </html>"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. New function — push rendered HTML + images to website repo
+# 3. Push rendered HTML + compressed images to website repo
 # ─────────────────────────────────────────────────────────────────────────────
 def push_blog_to_website(
     website_repo_name: str,
@@ -333,8 +326,7 @@ def push_blog_to_website(
     """
     Converts the markdown blog to Design B HTML and pushes it to the
     GitHub Pages website repo under blogs/<slug>/index.html.
-    Images are pushed to blogs/<slug>/images/*.
-
+    Images are compressed to <150KB then pushed to blogs/<slug>/images/*.
     Returns the live URL of the blog post.
     """
     g = Github(token)
@@ -342,7 +334,7 @@ def push_blog_to_website(
 
     elements = []
 
-    # 1. Generate and push the HTML page
+    # HTML page
     html_content = _md_to_html(md_content, blog_title, slug)
     elements.append(InputGitTreeElement(
         path=f"blogs/{slug}/index.html",
@@ -351,25 +343,25 @@ def push_blog_to_website(
         content=html_content,
     ))
 
-    # 2. Find all image references in the markdown and push them
-    # Images land at blogs/<slug>/images/<filename>
-    # HTML references them as src="images/<filename>" (same-folder-relative)
+    # Images — compress before pushing so GH Pages deploy never times out
     img_matches = re.findall(r"!\[.*?\]\((images/.*?)\)", md_content)
+    seen = set()
     for img_path_str in img_matches:
         img_path = Path(img_path_str)
-        if img_path.exists():
-            with open(img_path, "rb") as f:
-                raw = f.read()
-            blob = repo.create_git_blob(base64.b64encode(raw).decode("utf-8"), "base64")
-            img_filename = img_path.name
-            elements.append(InputGitTreeElement(
-                path=f"blogs/{slug}/images/{img_filename}",
-                mode="100644",
-                type="blob",
-                sha=blob.sha,
-            ))
+        if not img_path.exists() or img_path.name in seen:
+            continue
+        seen.add(img_path.name)
+        with open(img_path, "rb") as f:
+            raw = f.read()
+        compressed = _compress_image(raw)
+        blob = repo.create_git_blob(base64.b64encode(compressed).decode("utf-8"), "base64")
+        elements.append(InputGitTreeElement(
+            path=f"blogs/{slug}/images/{img_path.name}",
+            mode="100644",
+            type="blob",
+            sha=blob.sha,
+        ))
 
-    # 3. Single commit
     new_tree = repo.create_git_tree(elements, base_tree)
     parent   = repo.get_git_commit(ref.object.sha)
     commit   = repo.create_git_commit(commit_message, new_tree, [parent])
