@@ -127,14 +127,16 @@ def _md_to_html(md: str, blog_title: str, slug: str) -> str:
         while i < len(lines):
             line = lines[i]
 
-            # Images — rewrite path to be relative inside slug folder
+            # Images — path is relative to index.html which sits at blogs/<slug>/
+            # Images are at blogs/<slug>/images/ so src="images/filename.png" is correct
             img_match = re.match(r"!\[(.*?)\]\((images/.*?)\)", line.strip())
             if img_match:
-                alt  = img_match.group(1)
-                src  = img_match.group(2)
+                alt = img_match.group(1)
+                src = img_match.group(2)        # e.g. "images/foo.png"
+                img_filename = Path(src).name   # e.g. "foo.png"
                 html_parts.append(
                     f'<figure class="blog-figure">'
-                    f'<img src="../{src}" alt="{alt}" class="blog-img">'
+                    f'<img src="images/{img_filename}" alt="{alt}" class="blog-img">'
                     f'<figcaption>{alt}</figcaption></figure>'
                 )
                 i += 1
@@ -196,15 +198,10 @@ def _md_to_html(md: str, blog_title: str, slug: str) -> str:
         return "\n".join(html_parts)
 
     def _inline_md(text: str) -> str:
-        # Bold + italic
         text = re.sub(r"\*\*\*(.*?)\*\*\*", r"<strong><em>\1</em></strong>", text)
-        # Bold
         text = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", text)
-        # Italic
         text = re.sub(r"\*(.*?)\*", r"<em>\1</em>", text)
-        # Inline code
         text = re.sub(r"`(.*?)`", r"<code>\1</code>", text)
-        # Links
         text = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', text)
         return text
 
@@ -243,15 +240,11 @@ def _md_to_html(md: str, blog_title: str, slug: str) -> str:
 }}
 html{{scroll-behavior:smooth}}
 body{{background:var(--bg);color:var(--text);font-family:var(--font-body);font-size:16px;line-height:1.7;overflow-x:hidden}}
-
-/* NAV */
 nav{{position:fixed;top:0;left:0;right:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:16px 56px;background:rgba(249,248,245,0.95);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}}
 .nav-logo{{font-family:var(--font-display);font-weight:700;font-size:20px;letter-spacing:-0.5px;color:var(--text);text-decoration:none}}
 .nav-logo span{{color:var(--accent2)}}
 .nav-back{{font-family:var(--font-mono);font-size:11px;color:var(--muted);text-decoration:none;letter-spacing:.04em;transition:color .2s}}
 .nav-back:hover{{color:var(--accent2)}}
-
-/* HERO */
 .blog-hero{{max-width:var(--content-width);margin:0 auto;padding:120px 24px 40px}}
 .blog-tag-row{{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}}
 .blog-tag{{font-family:var(--font-mono);font-size:10px;color:var(--muted);background:var(--tag-bg);border:1px solid var(--border);padding:3px 10px;border-radius:20px;letter-spacing:.03em}}
@@ -259,8 +252,6 @@ nav{{position:fixed;top:0;left:0;right:0;z-index:100;display:flex;align-items:ce
 .blog-meta{{font-family:var(--font-mono);font-size:11px;color:var(--faint);margin-bottom:32px;display:flex;align-items:center;gap:12px}}
 .blog-meta-dot{{width:3px;height:3px;border-radius:50%;background:var(--faint)}}
 .blog-lede{{font-size:18px;color:var(--muted);line-height:1.75;font-style:italic;padding-bottom:32px;border-bottom:1px solid var(--border);font-family:var(--font-serif)}}
-
-/* BODY */
 .blog-body{{max-width:var(--content-width);margin:0 auto;padding:40px 24px 96px}}
 .blog-h2{{font-family:var(--font-display);font-size:clamp(20px,2.5vw,28px);font-weight:700;letter-spacing:-.6px;color:var(--text);margin:48px 0 16px;line-height:1.2}}
 .blog-h3{{font-family:var(--font-display);font-size:clamp(16px,2vw,20px);font-weight:600;letter-spacing:-.3px;color:var(--text);margin:32px 0 12px}}
@@ -281,13 +272,10 @@ nav{{position:fixed;top:0;left:0;right:0;z-index:100;display:flex;align-items:ce
 code{{font-family:var(--font-mono);font-size:13px;background:var(--tag-bg);padding:2px 6px;border-radius:3px;color:var(--accent2)}}
 a{{color:var(--accent2);text-decoration:none}}
 a:hover{{text-decoration:underline}}
-
-/* FOOTER */
 .blog-footer{{border-top:1px solid var(--border);padding:24px 56px;display:flex;justify-content:space-between;align-items:center}}
 .blog-footer p{{font-family:var(--font-mono);font-size:11px;color:var(--faint)}}
 .blog-footer a{{color:var(--faint);text-decoration:none;transition:color .2s}}
 .blog-footer a:hover{{color:var(--accent2)}}
-
 @media(max-width:768px){{
   nav{{padding:14px 20px}}
   .blog-hero{{padding:100px 20px 32px}}
@@ -363,7 +351,9 @@ def push_blog_to_website(
         content=html_content,
     ))
 
-    # 2. Find all image references in the markdown and push them too
+    # 2. Find all image references in the markdown and push them
+    # Images land at blogs/<slug>/images/<filename>
+    # HTML references them as src="images/<filename>" (same-folder-relative)
     img_matches = re.findall(r"!\[.*?\]\((images/.*?)\)", md_content)
     for img_path_str in img_matches:
         img_path = Path(img_path_str)
@@ -371,7 +361,6 @@ def push_blog_to_website(
             with open(img_path, "rb") as f:
                 raw = f.read()
             blob = repo.create_git_blob(base64.b64encode(raw).decode("utf-8"), "base64")
-            # Place images inside blogs/<slug>/images/ so the HTML can reference ../images/
             img_filename = img_path.name
             elements.append(InputGitTreeElement(
                 path=f"blogs/{slug}/images/{img_filename}",
