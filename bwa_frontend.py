@@ -16,7 +16,7 @@ import streamlit as st
 # Import your compiled LangGraph app
 # -----------------------------
 from bwa_backend import app
-from github_utils import push_to_github
+from github_utils import push_to_github, push_blog_to_website
 
 
 # -----------------------------
@@ -184,14 +184,14 @@ st.set_page_config(page_title="PM Blog Writer", layout="wide")
 
 def check_password() -> bool:
     import os
-    
+
     password = ""
     try:
         if "APP_PASSWORD" in st.secrets:
             password = st.secrets["APP_PASSWORD"]
     except Exception:
         pass
-        
+
     if not password:
         password = os.getenv("APP_PASSWORD", "")
 
@@ -227,11 +227,16 @@ with st.sidebar:
     run_btn = st.button("🚀 Generate Blog", type="primary")
 
     st.divider()
-    st.subheader("GitHub Settings")
-    gh_repo = st.text_input("Repository (user/repo)", value=os.getenv("GITHUB_REPO", "ashumishra2104/Blogs-for-Product-Managers-and-Leaders-"))
-    gh_branch = st.text_input("Branch", value=os.getenv("GITHUB_BRANCH", "main"))
-    
-    # Try to get token from secrets/env
+
+    # ── Blog Repo Settings ──────────────────────────────────────────────────
+    st.subheader("📁 Blog Repo (Markdown)")
+    gh_repo = st.text_input(
+        "Repository (user/repo)",
+        value=os.getenv("GITHUB_REPO", "ashumishra2104/Blogs-for-Product-Managers-and-Leaders-"),
+        key="gh_repo",
+    )
+    gh_branch = st.text_input("Branch", value=os.getenv("GITHUB_BRANCH", "main"), key="gh_branch")
+
     gh_token = ""
     try:
         if "GITHUB_TOKEN" in st.secrets:
@@ -240,13 +245,34 @@ with st.sidebar:
         pass
     if not gh_token:
         gh_token = os.getenv("GITHUB_TOKEN", "")
-    
-    gh_token_input = st.text_input("GitHub Token", value=gh_token if gh_token else "", type="password", help="Needed if not set in environment/secrets")
-    
+
+    gh_token_input = st.text_input(
+        "GitHub Token",
+        value=gh_token if gh_token else "",
+        type="password",
+        help="Used for both repo pushes. Set once here.",
+        key="gh_token",
+    )
+
     if not gh_token_input:
-        st.info("💡 Set `GITHUB_TOKEN` in secrets or enter it above to enable 'Push to GitHub'.")
+        st.info("💡 Set `GITHUB_TOKEN` in secrets or enter it above to enable pushing.")
 
     st.divider()
+
+    # ── Website Repo Settings ───────────────────────────────────────────────
+    st.subheader("🌐 Website Repo (ashumishra.co.in)")
+    website_repo = st.text_input(
+        "Website repository (user/repo)",
+        value=os.getenv("WEBSITE_REPO", "ashumishra2104/ashumishra2104.github.io"),
+        key="website_repo",
+    )
+    website_branch = st.text_input(
+        "Branch", value="main", key="website_branch"
+    )
+
+    st.divider()
+
+    # ── Past blogs ──────────────────────────────────────────────────────────
     st.subheader("Past blogs")
 
     past_files = list_past_blogs()
@@ -293,7 +319,7 @@ if "topic_prefill" in st.session_state and isinstance(st.session_state["topic_pr
 if "last_out" not in st.session_state:
     st.session_state["last_out"] = None
 
-# ── Tab layout — added 📚 Further Reading between Evidence and Preview ──
+# ── Tab layout ──────────────────────────────────────────────────────────────
 tab_plan, tab_evidence, tab_further, tab_preview, tab_images, tab_logs = st.tabs(
     ["🧩 Plan", "🔎 Evidence", "📚 Further Reading", "📝 Markdown Preview", "🖼️ Images", "🧾 Logs"]
 )
@@ -323,7 +349,7 @@ if run_btn:
         "merged_md": "",
         "md_with_placeholders": "",
         "image_specs": [],
-        "further_reading": "",   # NEW field
+        "further_reading": "",
         "final": "",
     }
 
@@ -354,7 +380,6 @@ if run_btn:
                 "sections_done": len(current_state.get("sections", []) or []),
             }
             progress_area.json(summary)
-
             log(f"[{kind}] {json.dumps(payload, default=str)[:1200]}")
 
         elif kind == "final":
@@ -364,11 +389,11 @@ if run_btn:
             log("[final] received final state")
 
 
-# ── Render last result ────────────────────────────────────────────────────────
+# ── Render last result ───────────────────────────────────────────────────────
 out = st.session_state.get("last_out")
 if out:
 
-    # ── Plan tab ──────────────────────────────────────────────────────────────
+    # ── Plan tab ─────────────────────────────────────────────────────────────
     with tab_plan:
         st.subheader("Blog Plan")
         plan_obj = out.get("plan")
@@ -390,7 +415,6 @@ if out:
 
             tasks = plan_dict.get("tasks", [])
             if tasks:
-                # ── NEW: includes pm_takeaway and requires_pm_translation ──
                 df = pd.DataFrame(
                     [
                         {
@@ -409,7 +433,6 @@ if out:
                 ).sort_values("id")
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
-                # ── PM takeaway summary cards ──
                 pm_sections = [t for t in tasks if t.get("requires_pm_translation")]
                 if pm_sections:
                     st.markdown("---")
@@ -422,7 +445,7 @@ if out:
                 with st.expander("Full task details (JSON)"):
                     st.json(tasks)
 
-    # ── Evidence tab ──────────────────────────────────────────────────────────
+    # ── Evidence tab ─────────────────────────────────────────────────────────
     with tab_evidence:
         st.subheader("Research Sources")
         st.caption(
@@ -454,7 +477,7 @@ if out:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             st.caption(f"{len(rows)} source(s) used in this blog.")
 
-    # ── Further Reading tab (NEW) ─────────────────────────────────────────────
+    # ── Further Reading tab ───────────────────────────────────────────────────
     with tab_further:
         st.subheader("📚 Further Reading")
         st.caption("Curated sources verified during research. Click any link to read the original.")
@@ -473,7 +496,6 @@ if out:
                 "- [First Round Review](https://review.firstround.com)"
             )
         else:
-            # Render as clickable cards — one per evidence item
             for i, item in enumerate(evidence_list, start=1):
                 if hasattr(item, "model_dump"):
                     item = item.model_dump()
@@ -519,6 +541,8 @@ if out:
                 blog_title = extract_title_from_md(final_md, "blog")
 
             md_filename = f"{safe_slug(blog_title)}.md"
+            slug = safe_slug(blog_title)
+
             st.download_button(
                 "⬇️ Download Markdown",
                 data=final_md.encode("utf-8"),
@@ -530,32 +554,104 @@ if out:
             st.download_button(
                 "📦 Download Bundle (MD + images)",
                 data=bundle,
-                file_name=f"{safe_slug(blog_title)}_bundle.zip",
+                file_name=f"{slug}_bundle.zip",
                 mime="application/zip",
             )
 
             st.markdown("---")
             st.subheader("🚀 Push to GitHub")
+
             if not gh_token_input:
                 st.warning("Please provide a GitHub Token in the sidebar to use this feature.")
             else:
                 commit_msg = st.text_input("Commit Message", value=f"Add blog post: {blog_title}")
-                if st.button("📤 Push to GitHub Repository", type="primary"):
-                    with st.spinner("Pushing to GitHub..."):
+
+                col1, col2 = st.columns(2)
+
+                # ── Push to Blog Repo ────────────────────────────────────────
+                with col1:
+                    st.markdown("**📁 Blog Repo**")
+                    st.caption(gh_repo)
+                    if st.button("📤 Push to Blog Repo", type="primary", key="push_blog_repo"):
+                        with st.spinner("Pushing markdown to blog repo…"):
+                            try:
+                                github_url = push_to_github(
+                                    repo_name=gh_repo,
+                                    branch=gh_branch,
+                                    token=gh_token_input,
+                                    md_content=final_md,
+                                    md_filename=md_filename,
+                                    commit_message=commit_msg,
+                                )
+                                st.success("🎉 Pushed to blog repo!")
+                                st.markdown(f"[View on GitHub]({github_url})")
+                            except Exception as e:
+                                st.error(f"Failed: {str(e)}")
+                                st.exception(e)
+
+                # ── Push to Website ──────────────────────────────────────────
+                with col2:
+                    st.markdown("**🌐 Website (ashumishra.co.in)**")
+                    st.caption(f"blogs/{slug}/")
+                    if st.button("🌍 Push to Website", type="primary", key="push_website"):
+                        with st.spinner("Converting to HTML and pushing to website…"):
+                            try:
+                                live_url = push_blog_to_website(
+                                    website_repo_name=website_repo,
+                                    branch=website_branch,
+                                    token=gh_token_input,
+                                    md_content=final_md,
+                                    blog_title=blog_title,
+                                    slug=slug,
+                                    commit_message=f"Publish blog: {blog_title}",
+                                )
+                                st.success("🎉 Live on your website!")
+                                st.markdown(f"[View live]({live_url})")
+                            except Exception as e:
+                                st.error(f"Failed: {str(e)}")
+                                st.exception(e)
+
+                # ── Push Both at Once ────────────────────────────────────────
+                st.markdown("---")
+                if st.button("🚀 Push to Both (Blog Repo + Website)", key="push_both"):
+                    results = {}
+                    with st.spinner("Pushing to both repos…"):
                         try:
-                            github_url = push_to_github(
+                            results["blog"] = push_to_github(
                                 repo_name=gh_repo,
                                 branch=gh_branch,
                                 token=gh_token_input,
                                 md_content=final_md,
                                 md_filename=md_filename,
-                                commit_message=commit_msg
+                                commit_message=commit_msg,
                             )
-                            st.success(f"🎉 Successfully pushed to GitHub!")
-                            st.markdown(f"**View file:** [{github_url}]({github_url})")
                         except Exception as e:
-                            st.error(f"Failed to push to GitHub: {str(e)}")
-                            st.exception(e)
+                            results["blog_error"] = str(e)
+
+                        try:
+                            results["website"] = push_blog_to_website(
+                                website_repo_name=website_repo,
+                                branch=website_branch,
+                                token=gh_token_input,
+                                md_content=final_md,
+                                blog_title=blog_title,
+                                slug=slug,
+                                commit_message=f"Publish blog: {blog_title}",
+                            )
+                        except Exception as e:
+                            results["website_error"] = str(e)
+
+                    if "blog" in results:
+                        st.success(f"📁 Blog repo: pushed!")
+                        st.markdown(f"[View on GitHub]({results['blog']})")
+                    if "blog_error" in results:
+                        st.error(f"📁 Blog repo failed: {results['blog_error']}")
+
+                    if "website" in results:
+                        st.success(f"🌐 Website: live!")
+                        st.markdown(f"[View on website]({results['website']})")
+                    if "website_error" in results:
+                        st.error(f"🌐 Website failed: {results['website_error']}")
 
     # ── Images tab ────────────────────────────────────────────────────────────
     with tab_images:
